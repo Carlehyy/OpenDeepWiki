@@ -2,7 +2,7 @@
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
     <TimeStamp>$([System.DateTime]::UtcNow.ToString("yyyyMMdd"))</TimeStamp>
-    <Version>2.0.3</Version>
+    <Version>1.0.0</Version>
     <!-- 项目信息 -->
     <Product>OpenDeepWiki</Product>
     <Title>OpenDeepWiki - AI驱动的代码知识库</Title>
