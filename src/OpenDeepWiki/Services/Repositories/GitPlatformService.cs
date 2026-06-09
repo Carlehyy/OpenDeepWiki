@@ -10,10 +10,15 @@ public class GitPlatformService(IHttpClientFactory httpClientFactory, ILogger<Gi
     private string? GitHubToken => configuration["GitHub:Token"];
     private string? GiteeToken => configuration["Gitee:Token"];
     private string? GitLabToken => configuration["GitLab:Token"];
+
+    // 华为云 CodeHub（内部代码托管，基于 GitLab，兼容 GitLab v4 API）。
+    // 未单独配置 HuaweiCodeHub:Token 时回退到 GitLab:Token。
+    private string? HuaweiCodeHubToken => configuration["HuaweiCodeHub:Token"] ?? GitLabToken;
+
     public async Task<GitRepoStats?> GetRepoStatsAsync(string gitUrl)
     {
-        var (platform, owner, repo) = ParseGitUrl(gitUrl);
-        
+        var (platform, owner, repo, host) = ParseGitUrl(gitUrl);
+
         if (platform == null || owner == null || repo == null)
         {
             return null;
@@ -23,15 +28,16 @@ public class GitPlatformService(IHttpClientFactory httpClientFactory, ILogger<Gi
         {
             "github" => await GetGitHubStatsAsync(owner, repo),
             "gitee" => await GetGiteeStatsAsync(owner, repo),
-            "gitlab" => await GetGitLabStatsAsync(owner, repo),
+            "gitlab" => await GetGitLabCompatibleStatsAsync("https://gitlab.com/api/v4", GitLabToken, owner, repo),
+            "huawei" => await GetGitLabCompatibleStatsAsync($"https://{host}/api/v4", HuaweiCodeHubToken, owner, repo),
             _ => null
         };
     }
 
     public async Task<GitBranchesResult> GetBranchesAsync(string gitUrl)
     {
-        var (platform, owner, repo) = ParseGitUrl(gitUrl);
-        
+        var (platform, owner, repo, host) = ParseGitUrl(gitUrl);
+
         if (platform == null || owner == null || repo == null)
         {
             return new GitBranchesResult([], null, false);
@@ -41,46 +47,53 @@ public class GitPlatformService(IHttpClientFactory httpClientFactory, ILogger<Gi
         {
             "github" => await GetGitHubBranchesAsync(owner, repo),
             "gitee" => await GetGiteeBranchesAsync(owner, repo),
-            "gitlab" => await GetGitLabBranchesAsync(owner, repo),
+            "gitlab" => await GetGitLabCompatibleBranchesAsync("https://gitlab.com/api/v4", GitLabToken, owner, repo),
+            "huawei" => await GetGitLabCompatibleBranchesAsync($"https://{host}/api/v4", HuaweiCodeHubToken, owner, repo),
             _ => new GitBranchesResult([], null, false)
         };
     }
 
-    private static (string? platform, string? owner, string? repo) ParseGitUrl(string gitUrl)
+    /// <summary>
+    /// 解析 Git 仓库地址，返回平台标识、owner、repo 以及 host。
+    /// 支持: github.com / gitee.com / gitlab.com / 华为云 CodeHub(codehub-g.huawei.com)。
+    /// 如需支持其它自建 GitLab 实例，可在下方 host 匹配处增加对应域名并复用 GitLab 兼容方法。
+    /// </summary>
+    private static (string? platform, string? owner, string? repo, string? host) ParseGitUrl(string gitUrl)
     {
         try
         {
             // 支持格式: https://github.com/owner/repo 或 https://github.com/owner/repo.git
             var uri = new Uri(gitUrl.TrimEnd('/'));
             var host = uri.Host.ToLowerInvariant();
-            
+
             string? platform = host switch
             {
                 "github.com" => "github",
                 "gitee.com" => "gitee",
                 "gitlab.com" => "gitlab",
+                "codehub-g.huawei.com" or "codehub.huawei.com" => "huawei",
                 _ => null
             };
 
             if (platform == null)
             {
-                return (null, null, null);
+                return (null, null, null, host);
             }
 
             var segments = uri.AbsolutePath.Trim('/').Split('/');
             if (segments.Length < 2)
             {
-                return (null, null, null);
+                return (null, null, null, host);
             }
 
             var owner = segments[0];
             var repo = segments[1].Replace(".git", "", StringComparison.OrdinalIgnoreCase);
 
-            return (platform, owner, repo);
+            return (platform, owner, repo, host);
         }
         catch
         {
-            return (null, null, null);
+            return (null, null, null, null);
         }
     }
 
@@ -259,23 +272,28 @@ public class GitPlatformService(IHttpClientFactory httpClientFactory, ILogger<Gi
         }
     }
 
-    private async Task<GitRepoStats?> GetGitLabStatsAsync(string owner, string repo)
+    /// <summary>
+    /// 获取 GitLab 兼容平台(GitLab.com / 自建 GitLab / 华为云 CodeHub)的仓库统计信息。
+    /// </summary>
+    /// <param name="apiBaseUrl">API 根地址，例如 https://gitlab.com/api/v4</param>
+    /// <param name="token">访问令牌(PRIVATE-TOKEN 头)，可为空</param>
+    private async Task<GitRepoStats?> GetGitLabCompatibleStatsAsync(string apiBaseUrl, string? token, string owner, string repo)
     {
         try
         {
             var client = httpClientFactory.CreateClient();
             client.DefaultRequestHeaders.Add("User-Agent", "OpenDeepWiki");
-            if (!string.IsNullOrEmpty(GitLabToken))
+            if (!string.IsNullOrEmpty(token))
             {
-                client.DefaultRequestHeaders.Add("PRIVATE-TOKEN", GitLabToken);
+                client.DefaultRequestHeaders.Add("PRIVATE-TOKEN", token);
             }
 
             var projectPath = Uri.EscapeDataString($"{owner}/{repo}");
-            var response = await client.GetAsync($"https://gitlab.com/api/v4/projects/{projectPath}");
+            var response = await client.GetAsync($"{apiBaseUrl}/projects/{projectPath}");
 
             if (!response.IsSuccessStatusCode)
             {
-                logger.LogWarning("获取GitLab仓库信息失败: {Owner}/{Repo}, 状态码: {StatusCode}", owner, repo, response.StatusCode);
+                logger.LogWarning("获取GitLab兼容平台仓库信息失败: {ApiBase} {Owner}/{Repo}, 状态码: {StatusCode}", apiBaseUrl, owner, repo, response.StatusCode);
                 return null;
             }
 
@@ -283,48 +301,56 @@ public class GitPlatformService(IHttpClientFactory httpClientFactory, ILogger<Gi
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            var starCount = root.GetProperty("star_count").GetInt32();
-            var forkCount = root.GetProperty("forks_count").GetInt32();
+            var starCount = root.TryGetProperty("star_count", out var starProp) ? starProp.GetInt32() : 0;
+            var forkCount = root.TryGetProperty("forks_count", out var forkProp) ? forkProp.GetInt32() : 0;
 
             return new GitRepoStats(starCount, forkCount);
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "获取GitLab仓库统计信息异常: {Owner}/{Repo}", owner, repo);
+            logger.LogWarning(ex, "获取GitLab兼容平台仓库统计信息异常: {ApiBase} {Owner}/{Repo}", apiBaseUrl, owner, repo);
             return null;
         }
     }
 
-    private async Task<GitBranchesResult> GetGitLabBranchesAsync(string owner, string repo)
+    /// <summary>
+    /// 获取 GitLab 兼容平台(GitLab.com / 自建 GitLab / 华为云 CodeHub)的分支列表。
+    /// </summary>
+    /// <param name="apiBaseUrl">API 根地址，例如 https://gitlab.com/api/v4</param>
+    /// <param name="token">访问令牌(PRIVATE-TOKEN 头)，可为空</param>
+    private async Task<GitBranchesResult> GetGitLabCompatibleBranchesAsync(string apiBaseUrl, string? token, string owner, string repo)
     {
         try
         {
             var client = httpClientFactory.CreateClient();
             client.DefaultRequestHeaders.Add("User-Agent", "OpenDeepWiki");
-            if (!string.IsNullOrEmpty(GitLabToken))
+            if (!string.IsNullOrEmpty(token))
             {
-                client.DefaultRequestHeaders.Add("PRIVATE-TOKEN", GitLabToken);
+                client.DefaultRequestHeaders.Add("PRIVATE-TOKEN", token);
             }
 
             var projectPath = Uri.EscapeDataString($"{owner}/{repo}");
 
             // 先获取默认分支
-            var repoResponse = await client.GetAsync($"https://gitlab.com/api/v4/projects/{projectPath}");
+            var repoResponse = await client.GetAsync($"{apiBaseUrl}/projects/{projectPath}");
             string? defaultBranch = null;
 
             if (repoResponse.IsSuccessStatusCode)
             {
                 var repoJson = await repoResponse.Content.ReadAsStringAsync();
                 using var repoDoc = JsonDocument.Parse(repoJson);
-                defaultBranch = repoDoc.RootElement.GetProperty("default_branch").GetString();
+                if (repoDoc.RootElement.TryGetProperty("default_branch", out var dbProp) && dbProp.ValueKind == JsonValueKind.String)
+                {
+                    defaultBranch = dbProp.GetString();
+                }
             }
 
             // 获取分支列表
-            var branchesResponse = await client.GetAsync($"https://gitlab.com/api/v4/projects/{projectPath}/repository/branches?per_page=100");
+            var branchesResponse = await client.GetAsync($"{apiBaseUrl}/projects/{projectPath}/repository/branches?per_page=100");
 
             if (!branchesResponse.IsSuccessStatusCode)
             {
-                logger.LogWarning("获取GitLab分支列表失败: {Owner}/{Repo}, 状态码: {StatusCode}", owner, repo, branchesResponse.StatusCode);
+                logger.LogWarning("获取GitLab兼容平台分支列表失败: {ApiBase} {Owner}/{Repo}, 状态码: {StatusCode}", apiBaseUrl, owner, repo, branchesResponse.StatusCode);
                 return new GitBranchesResult([], defaultBranch, true);
             }
 
@@ -341,7 +367,7 @@ public class GitPlatformService(IHttpClientFactory httpClientFactory, ILogger<Gi
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "获取GitLab分支列表异常: {Owner}/{Repo}", owner, repo);
+            logger.LogWarning(ex, "获取GitLab兼容平台分支列表异常: {ApiBase} {Owner}/{Repo}", apiBaseUrl, owner, repo);
             return new GitBranchesResult([], null, true);
         }
     }
