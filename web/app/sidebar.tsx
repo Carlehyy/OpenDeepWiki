@@ -60,6 +60,12 @@ const itemKeys = [
     { key: "mcp", url: "/mcp", icon: Zap, requireAuth: false },
 ];
 
+// ===== 二次开发可配置项 =====
+// 隐藏的导航项（推荐 / 订阅 / 收藏夹 / 机构目录）；如需恢复，从集合中移除对应 key 即可。
+const HIDDEN_ITEM_KEYS = new Set<string>(["recommend", "subscribe", "bookmarks", "organizations"]);
+// 是否显示底部 GitHub / 飞书 社区入口；设为 true 可恢复。
+const SHOW_COMMUNITY_LINKS: boolean = false;
+
 interface AppSidebarProps extends React.ComponentProps<typeof Sidebar> {
     activeItem?: string;
     onItemClick?: (title: string) => void;
@@ -94,12 +100,14 @@ export function AppSidebar({ activeItem, onItemClick, ...props }: AppSidebarProp
     const displayVersion = versionInfo?.version?.split('+')[0] || '';
     const isPreview = displayVersion.toLowerCase().includes('preview');
 
-    const items = itemKeys.map(item => ({
-        title: t(`sidebar.${item.key}`),
-        url: item.url,
-        icon: item.icon,
-        requireAuth: item.requireAuth,
-    }));
+    const items = itemKeys
+        .filter((item) => !HIDDEN_ITEM_KEYS.has(item.key))
+        .map(item => ({
+            title: t(`sidebar.${item.key}`),
+            url: item.url,
+            icon: item.icon,
+            requireAuth: item.requireAuth,
+        }));
 
     const handleItemClick = (item: typeof items[0]) => {
         if (item.requireAuth && !isAuthenticated) {
@@ -116,12 +124,12 @@ export function AppSidebar({ activeItem, onItemClick, ...props }: AppSidebarProp
                     <SidebarGroupLabel>
                         <Image
                             src="/favicon.png"
-                            alt="OpenDeepWiki"
+                            alt="CodeBook"
                             width={24}
                             height={24}
                             className="shrink-0 rounded"
                         />
-                        <span className="ml-2">OpenDeepWiki</span>
+                        <span className="ml-2">CodeBook</span>
                     </SidebarGroupLabel>
                     <SidebarGroupContent>
                         <SidebarMenu>
@@ -152,6 +160,8 @@ export function AppSidebar({ activeItem, onItemClick, ...props }: AppSidebarProp
                 </SidebarGroup>
             </SidebarContent>
             <SidebarFooter>
+                {/* 二次开发：GitHub / 飞书 社区入口，由 SHOW_COMMUNITY_LINKS 控制显隐 */}
+                {SHOW_COMMUNITY_LINKS && (
                 <SidebarMenu>
                     <SidebarMenuItem>
                         <SidebarMenuButton asChild tooltip={t("sidebar.github")}>
@@ -193,6 +203,7 @@ export function AppSidebar({ activeItem, onItemClick, ...props }: AppSidebarProp
                         </div>
                     </SidebarMenuItem>
                 </SidebarMenu>
+                )}
                 {displayVersion && (
                     <div className="px-3 py-2 border-t">
                         <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
